@@ -76,8 +76,31 @@ def map_code(file, func, line, cutoff)
     end
 end
 
-def render(traced_functions)
+def score(traced_functions)
   traced_functions
+    .flat_map { |file, funcs| funcs.values.flatten }
+    .reduce({experts: {}, suspects: {}, depth: 0}) do |acc, line|
+      author = line[:blame][:author]
+      acc[:experts][author] ||= 0
+      acc[:experts][author] += 1
+
+      if line[:changed]
+        acc[:suspects][author] ||= 0
+        acc[:suspects][author] += 1
+      end
+
+      if line[:in_trace]
+        acc[:depth] += 1
+        acc[:suspects][author] ||= 0
+        acc[:suspects][author] += 3.0 / acc[:depth]
+      end
+      acc
+    end
+end
+
+def render(traced_functions)
+  score = score(traced_functions)
+  trace = traced_functions
     .reduce([]) do |acc, (file_name, funcs)|
       funcs.each do |func_name, func|
         trace_line = func.detect { |l| l[:in_trace] }
@@ -93,6 +116,21 @@ def render(traced_functions)
       end
       acc
     end
+
+  experts = score[:experts]
+    .sort_by { |name, score| score }
+    .reverse
+    .map { |name, score| "#{name} (#{score.round(1)})" }
+
+  suspects = score[:suspects]
+    .sort_by { |name, score| score }
+    .reverse
+    .map { |name, score| "#{name} (#{score.round(1)})" }
+
+  [
+    "Experts: #{experts.join(", ")}",
+    "Suspects: #{suspects.join(", ")}"
+  ] + trace
 end
 
 def main(error_id, cutoff)

@@ -1,6 +1,6 @@
 Gem::Specification.new do |s|
   s.name = "whatbug"
-  s.version = "0.0.2"
+  s.version = "0.0.3"
   s.date = "2017-01-03"
   s.summary = "Find the source of the bug with WhatBug"
   s.description = "WhatBug helps you find where a bug was introduced faster by finding all lines of code in the relevant functions of a stack trace and identifying which of those have changed within a timeframe."
