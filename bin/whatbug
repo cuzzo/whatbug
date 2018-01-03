@@ -1,0 +1,139 @@
+#! /usr/bin/env ruby
+
+require "dotenv"
+
+require_relative "../lib/git_client"
+require_relative "../lib/rollbar_client"
+require_relative "../lib/airbrake_client"
+require_relative "../lib/tracer"
+
+Dotenv.load()
+
+BLAME_DATE_RGX = /\([^)]*\)/
+DATE_RGX = /\d{1,4}[-.\/]\d{1,2}[-.\/]\d{1,4}/
+
+def get_error(id)
+  raise "No error ID given" if id.nil? || id.length == 0
+
+  if ENV.has_key?("ROLLBAR_API_KEY")
+    config = {
+      "username" => ENV["ROLLBAR_USERNAME"],
+      "api_key" => ENV["ROLLBAR_API_KEY"],
+      "project" => ENV["ROLLBAR_PROJECT"],
+      "environment" => ENV["ROLLBAR_ENVIRONMENT"]
+    }
+    errorClass = RollbarClient
+  elsif ENV.has_key?("AIRBRAKE_API_KEY")
+    config = {
+      "api_key" => ENV["AIRBRAKE_API_KEY"],
+      "project_id" => ENV["AIRBRAKE_PROJECT_ID"],
+      "environment" => ENV["AIRBRAKE_ENVIRONMENT"]
+    }
+    errorClass = AirbrakeClient
+  else
+    raise "Unable to find ENV VARS for AIRBRAKE_API_KEY or ROLLBAR_API_KEY"
+  end
+
+  errorClass
+    .new(config)
+    .get_error(id)
+end
+
+def map_code(file, func, line, cutoff)
+  blames = GitClient
+    .new
+    .blame(file[:path], func[:start], func[:end])
+    .map do |blame_line|
+      date = blame_line
+        .scan(BLAME_DATE_RGX)
+        .first
+        .gsub(/\s+\d+\)$/, "")
+
+      commit = blame_line.split(" ").first
+      date_start = date.index(DATE_RGX)
+      author = date[1...(date_start - 1)]
+      date = DateTime.parse(date[date_start..-1]) rescue DateTime.new
+
+      {
+        commit: commit,
+        author: author,
+        date: date
+      }
+    end
+
+  start = func[:start] - 1
+  file[:code][start...func[:end]]
+    .each_with_index
+    .map do |line, index|
+      blame = blames.shift()
+      {
+        text: line,
+        line_num: func[:start] + index,
+        changed: blame[:date] > cutoff,
+        in_trace: false,
+        blame: blame
+      }
+    end
+end
+
+def render(traced_functions)
+  traced_functions
+    .reduce([]) do |acc, (file_name, funcs)|
+      funcs.each do |func_name, func|
+        trace_line = func.detect { |l| l[:in_trace] }
+
+        acc << "#{file_name}:#{trace_line[:line_num]} - #{func_name}"
+        func.each do |line|
+          line_num = line[:line_num].to_s.rjust(3, " ")
+          change_sym = line[:changed] ? "+" : " "
+          trace_sym = line[:in_trace] ? "X" : " "
+
+          acc << "#{change_sym}#{trace_sym}#{line_num}) #{line[:text]}"
+        end
+      end
+      acc
+    end
+end
+
+def main(error_id, cutoff)
+  cutoff = cutoff.nil? ? (Date.today - 7).to_datetime : DateTime.parse(cutoff)
+  project_root = ENV["PROJECT_ROOT"] || Dir.pwd
+
+  tracer = Tracer.new()
+
+  error = get_error(error_id)
+  files = error[:stack_trace]
+    .map { |trace| trace[:file] }
+    .uniq
+    .reduce({}) do |acc, file|
+      parts = File.split(project_root) + file.split("/")
+      path = File.join(*parts)
+      code = File.read(path)
+      acc[file] = {
+        path: file,
+        code: code.lines,
+        funcs: tracer.trace(path, code)
+      }
+      acc
+    end
+
+  Dir.chdir(project_root)
+  traced_functions = error[:stack_trace]
+    .reduce({})  do |acc, trace|
+      file = files[trace[:file]]
+      line = trace[:line]
+      func = file[:funcs].detect { |func| func[:start] <= line && func[:end] >= line }
+      if not func.nil?
+        line_start = line - func[:start]
+
+        acc[trace[:file]] ||= {}
+        acc[trace[:file]][func[:name]] ||= map_code(file, func, line, cutoff)
+        acc[trace[:file]][func[:name]][line_start][:in_trace] = true
+      end
+      acc
+    end
+
+  STDOUT.puts render(traced_functions)
+end
+
+main(ARGV[0], ARGV[1])
